@@ -8,9 +8,7 @@ import {
 import {
   getAssociatedTokenAddress, createTransferInstruction,
   createAssociatedTokenAccountInstruction, TOKEN_PROGRAM_ID,
-  createInitializeMultisigInstruction, MULTISIG_SIZE,
-  NATIVE_MINT, createSyncNativeInstruction,
-  createSetAuthorityInstruction, AuthorityType
+  createInitializeMultisigInstruction, MULTISIG_SIZE
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import crypto from 'crypto';
@@ -49,6 +47,7 @@ const MAINNET = RPC.includes('mainnet');
 const conn = new Connection(RPC, 'confirmed');
 console.log(`FEE:${FPA.slice(0, 8)} NET:${MAINNET ? 'MAIN' : 'DEV'}`);
 
+// Log fee payer balance at startup — if this is 0 the bot cannot create vaults.
 conn.getBalance(feePayer.publicKey).then(b => {
   console.log(`FEE_PAYER_BAL: ${(b / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
   if (b < 0.01 * LAMPORTS_PER_SOL)
@@ -123,81 +122,6 @@ async function createMultisigOnChain(userPublicKey) {
   return ms.publicKey;
 }
 
-// ===== SWEEP NATIVE SOL → wSOL IN MULTISIG VAULT =====
-// Moves all native SOL from userKeypair's address into a wSOL token account
-// owned by the 2-of-2 multisig. After this, the user's keypair address holds
-// ~0 lamports, so Phantom / gasless services have nothing to spend.
-async function sweepSolToVault(userKeypair, msPublicKey) {
-  const balance = await conn.getBalance(userKeypair.publicKey);
-  const sweepable = balance - 5000; // keep just enough for this tx's fee
-  if (sweepable <= 0) return;
-
-  const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, msPublicKey, true);
-  const ixs = [];
-
-  if (!(await conn.getAccountInfo(wsolAta).catch(() => null))) {
-    ixs.push(createAssociatedTokenAccountInstruction(
-      feePayer.publicKey, wsolAta, msPublicKey, NATIVE_MINT
-    ));
-  }
-
-  // Transfer lamports into the wSOL ATA, then syncNative so token balance matches
-  ixs.push(SystemProgram.transfer({
-    fromPubkey: userKeypair.publicKey,
-    toPubkey: wsolAta,
-    lamports: sweepable
-  }));
-  ixs.push(createSyncNativeInstruction(wsolAta));
-
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const tx = new VersionedTransaction(
-    new TransactionMessage({
-      payerKey: feePayer.publicKey,
-      recentBlockhash: blockhash,
-      instructions: ixs
-    }).compileToV0Message()
-  );
-  tx.sign([feePayer, userKeypair]);
-  await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
-}
-
-// ===== MIGRATE EXISTING TOKEN ACCOUNTS TO MULTISIG AUTHORITY =====
-// Changes AccountOwner authority on all SPL token accounts from the user's
-// keypair to the multisig. A single key can no longer move any token.
-async function migrateTokenAccounts(userKeypair, msPublicKey) {
-  const accts = await conn.getParsedTokenAccountsByOwner(
-    userKeypair.publicKey, { programId: TOKEN_PROGRAM_ID }
-  ).catch(() => ({ value: [] }));
-
-  if (!accts.value.length) return;
-
-  const BATCH = 10;
-  for (let i = 0; i < accts.value.length; i += BATCH) {
-    const batch = accts.value.slice(i, i + BATCH);
-    const ixs = batch.map(t =>
-      createSetAuthorityInstruction(
-        new PublicKey(t.pubkey),
-        userKeypair.publicKey,
-        AuthorityType.AccountOwner,
-        msPublicKey,
-        [],
-        TOKEN_PROGRAM_ID
-      )
-    );
-
-    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-    const tx = new VersionedTransaction(
-      new TransactionMessage({
-        payerKey: feePayer.publicKey,
-        recentBlockhash: blockhash,
-        instructions: ixs
-      }).compileToV0Message()
-    );
-    tx.sign([feePayer, userKeypair]);
-    await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
-  }
-}
-
 // ===== VAULT =====
 async function createVault(uid) {
   const seed = crypto.createHash('sha256').update(uid + Date.now() + Math.random()).digest();
@@ -227,14 +151,7 @@ async function convertVault(uid, pkey) {
 
   if (user.publicKey.toBase58() === FPA) throw new Error('Cannot convert fee payer');
 
-  // Step 1: create 2-of-2 multisig on-chain
   const msPublicKey = await createMultisigOnChain(user.publicKey);
-
-  // Step 2: sweep native SOL → wSOL locked under multisig authority
-  await sweepSolToVault(user, msPublicKey);
-
-  // Step 3: transfer authority of all existing SPL token accounts to multisig
-  await migrateTokenAccounts(user, msPublicKey);
 
   const w = {
     pk: user.publicKey.toBase58(),
@@ -248,15 +165,6 @@ async function convertVault(uid, pkey) {
   return w;
 }
 
-// Wrap any fresh native SOL that arrived at the vault address since last sweep
-async function wrapVaultSol(pk) {
-  const w = cache.get(pk);
-  if (!w) throw new Error('Vault not found');
-  const user = Keypair.fromSecretKey(bs58.decode(w.sk));
-  const ms = new PublicKey(w.ms);
-  await sweepSolToVault(user, ms);
-}
-
 function getUserWallets(uid) {
   return cache.keys().map(k => cache.get(k)).filter(w => w && w.uid === String(uid));
 }
@@ -264,33 +172,20 @@ function getUserWallets(uid) {
 async function getVaultBal(pk) {
   const w = cache.get(pk);
   const p = new PublicKey(pk);
+  const solBal = await conn.getBalance(p).catch(() => 0);
 
-  // Native SOL sitting at the vault address (unwrapped — NOT locked yet)
-  const nativeLamports = await conn.getBalance(p).catch(() => 0);
-
-  let wsolAmt = 0;
-  const tokens = [];
-
-  if (w?.ms) {
+  let tokens = [];
+  if (w && w.ms) {
     const msP = new PublicKey(w.ms);
     const toks = await conn.getParsedTokenAccountsByOwner(msP, { programId: TOKEN_PROGRAM_ID })
       .catch(() => ({ value: [] }));
-
-    for (const t of toks.value) {
-      const info = t.account.data.parsed.info;
-      if (info.mint === NATIVE_MINT.toBase58()) {
-        wsolAmt = info.tokenAmount.uiAmount ?? 0;
-      } else {
-        tokens.push({ mint: info.mint, amt: info.tokenAmount.uiAmount });
-      }
-    }
+    tokens = toks.value.map(t => ({
+      mint: t.account.data.parsed.info.mint,
+      amt: t.account.data.parsed.info.tokenAmount.uiAmount
+    }));
   }
 
-  return {
-    sol: nativeLamports / LAMPORTS_PER_SOL, // unwrapped, needs wrap to be locked
-    wsol: wsolAmt,                           // locked wSOL in multisig vault
-    tokens
-  };
+  return { sol: solBal / LAMPORTS_PER_SOL, tokens };
 }
 
 async function getBal(pk) {
@@ -314,12 +209,12 @@ async function buildTx(from, to, amt, mint) {
   if (!w) throw new Error('Not found');
 
   const fk = Keypair.fromSecretKey(bs58.decode(w.sk));
+  const fp = new PublicKey(from);
   const ms = new PublicKey(w.ms);
   const tp = new PublicKey(to);
   const ixs = [];
 
   if (mint) {
-    // SPL token transfer — source ATA owned by multisig
     const mp = new PublicKey(mint);
     const fa = await getAssociatedTokenAddress(mp, ms, true);
     const ta = await getAssociatedTokenAddress(mp, tp);
@@ -333,21 +228,11 @@ async function buildTx(from, to, amt, mint) {
       [fk.publicKey, feePayer.publicKey]
     ));
   } else {
-    // SOL send — transfers wSOL from multisig vault, requires both signatures.
-    // User's keypair address has ~0 native SOL, so Phantom / gasless cannot
-    // bypass this path: there is nothing at an address the user controls alone.
-    const wsolSrc = await getAssociatedTokenAddress(NATIVE_MINT, ms, true);
-    const wsolDst = await getAssociatedTokenAddress(NATIVE_MINT, tp);
-    const lamports = BigInt(Math.floor(amt * LAMPORTS_PER_SOL));
-
-    if (!(await conn.getAccountInfo(wsolDst).catch(() => null))) {
-      ixs.push(createAssociatedTokenAccountInstruction(feePayer.publicKey, wsolDst, tp, NATIVE_MINT));
-    }
-
-    ixs.push(createTransferInstruction(
-      wsolSrc, wsolDst, ms, lamports,
-      [fk.publicKey, feePayer.publicKey]
-    ));
+    ixs.push(SystemProgram.transfer({
+      fromPubkey: fp,
+      toPubkey: tp,
+      lamports: Math.floor(amt * LAMPORTS_PER_SOL)
+    }));
   }
 
   const { blockhash } = await conn.getLatestBlockhash();
@@ -450,23 +335,17 @@ bot.on('callback_query', async q => {
       const w = await createVault(String(cid));
       await ed(
         `✅ *Vault Created!*\n\n` +
-        `💰 *Deposit SOL here:*\n\`${w.pk}\`\n\n` +
-        `🪙 *Deposit SPL tokens here:*\n\`${w.ms}\`\n\n` +
+        `💰 *SOL Address:*\n\`${w.pk}\`\n\n` +
+        `🪙 *Token Address:*\n\`${w.ms}\`\n\n` +
         `🔑 *Private Key:*\n\`${w.sk}\`\n\n` +
-        `⚠️ After depositing SOL, open the vault and tap *Wrap SOL → Lock* to enforce the multisig.\n` +
-        `Key alone is useless — this bot must co-sign every transaction`,
+        `⚠️ Key alone is useless — this bot must co-sign every transaction`,
         backBtn
       );
     }
 
     else if (d === 'convert') {
       states.set(cid, { action: 'convert' });
-      await ed(
-        '🔒 Send your private key to lock it to this bot:\n\n' +
-        '⚠️ *All SOL and tokens will be swept into the vault multisig immediately.*\n' +
-        'After conversion the key is useless without the bot — on Phantom, on Jupiter, everywhere.',
-        cancelBtn
-      );
+      await ed('🔒 Send your private key to lock it to this bot:', cancelBtn);
     }
 
     else if (d === 'wallets') {
@@ -476,9 +355,8 @@ bot.on('callback_query', async q => {
       let t = '*Your Vaults*\n\n';
       const btns = [];
       for (const w of ws) {
-        const b = await getVaultBal(w.pk);
-        const total = b.wsol + b.sol;
-        t += `${w.label}\n\`${w.pk.slice(0, 12)}...\`\n${total.toFixed(4)} SOL\n\n`;
+        const b = await conn.getBalance(new PublicKey(w.pk)).catch(() => 0);
+        t += `${w.label}\n\`${w.pk.slice(0, 12)}...\`\n${(b / LAMPORTS_PER_SOL).toFixed(4)} SOL\n\n`;
         btns.push([{ text: w.label, callback_data: `det_${w.pk}` }]);
       }
       btns.push([{ text: '🔙 Back', callback_data: 'main' }]);
@@ -520,16 +398,11 @@ bot.on('callback_query', async q => {
         '2-of-2 multisig enforced on-chain:\n\n' +
         '✅ Your key + this bot = transaction executes\n' +
         '❌ Your key alone = rejected by Solana network\n' +
-        '❌ Phantom = no bot co-signature → fails on-chain\n' +
-        '❌ Jupiter = no bot co-signature → fails on-chain\n' +
-        '❌ Gasless services = no funds at user address → nothing to send\n' +
+        '❌ Phantom = missing bot signature → fails\n' +
+        '❌ Jupiter = missing bot signature → fails\n' +
         '❌ Other bots = wrong fee payer key → fails\n\n' +
-        '*SOL is locked as wSOL:*\n' +
-        '1. Deposit native SOL to the SOL Address\n' +
-        '2. Tap "Wrap SOL → Lock" — SOL moves into multisig wSOL account\n' +
-        '3. Single-key transfers are now impossible on-chain\n\n' +
-        '*SPL tokens:* deposit to Token Address — already locked\n\n' +
-        '*Recipient gets wSOL* (unwrappable with any Solana wallet)',
+        '*SOL Address* → deposit SOL here\n' +
+        '*Token Address* → deposit SPL tokens here',
         backBtn
       );
     }
@@ -539,25 +412,17 @@ bot.on('callback_query', async q => {
       const w = cache.get(pk);
       if (!w) return ed('Not found', backBtn);
       const b = await getVaultBal(pk);
-
       const tokenLines = b.tokens.length
         ? b.tokens.map(t => `${t.amt} \`${t.mint.slice(0, 8)}...\``).join('\n')
         : '_none_';
-
-      const unwrappedLine = b.sol > 0.000001
-        ? `\n⚠️ *Unwrapped:* ${b.sol.toFixed(6)} SOL (tap Wrap to lock)`
-        : '';
-
       await ed(
         `*${w.label}*\n\n` +
-        `💰 *SOL Deposit Address:*\n\`${w.pk}\`\n` +
-        `🔒 Locked wSOL: ${b.wsol.toFixed(4)} SOL${unwrappedLine}\n\n` +
-        `🪙 *Token Deposit Address:*\n\`${w.ms}\`\n${tokenLines}`,
+        `💰 SOL Address:\n\`${w.pk}\`\n${b.sol.toFixed(4)} SOL\n\n` +
+        `🪙 Token Address:\n\`${w.ms}\`\n${tokenLines}`,
         {
           reply_markup: {
             inline_keyboard: [
-              [{ text: '💸 Send wSOL', callback_data: `sf_${pk}` }],
-              [{ text: '🔄 Wrap SOL → Lock', callback_data: `wv_${pk}` }],
+              [{ text: '💸 Send SOL', callback_data: `sf_${pk}` }],
               [{ text: '🔑 Show Key', callback_data: `ex_${pk}` }],
               [{ text: '📋 Copy SOL Addr', callback_data: `cp_${pk}` }],
               [{ text: '📋 Copy Token Addr', callback_data: `cpm_${pk}` }],
@@ -565,20 +430,6 @@ bot.on('callback_query', async q => {
             ]
           }
         }
-      );
-    }
-
-    else if (d.startsWith('wv_')) {
-      const pk = d.slice(3);
-      await ed('⏳ Wrapping SOL into vault...', {});
-      await wrapVaultSol(pk);
-      const b = await getVaultBal(pk);
-      await ed(
-        `✅ *SOL Wrapped & Locked*\n\n` +
-        `🔒 Locked wSOL: ${b.wsol.toFixed(4)} SOL\n` +
-        `Remaining native: ${b.sol.toFixed(6)} SOL\n\n` +
-        `Funds can only be moved by this bot.`,
-        backBtn
       );
     }
 
@@ -611,7 +462,7 @@ bot.on('callback_query', async q => {
 
       await ed('⏳ Signing and sending...', {});
       const r = await submitTx(id);
-      await ed(`✅ *Sent!*\n\n[View on Solscan](${r.url})\n\n${s.amt} SOL (wSOL) sent\nGas sponsored by bot`, backBtn);
+      await ed(`✅ *Sent!*\n\n[View on Solscan](${r.url})\n\n${s.amt} SOL sent\nGas sponsored by bot`, backBtn);
       states.delete(cid);
     }
 
@@ -640,17 +491,13 @@ bot.on('message', async msg => {
 
   try {
     if (s.action === 'convert') {
-      await bot.sendMessage(cid,
-        '⏳ Locking wallet on-chain...\n\nSweeping SOL to wSOL and migrating token accounts — this may take a moment.',
-        { parse_mode: 'Markdown' }
-      );
+      await bot.sendMessage(cid, '⏳ Locking wallet on-chain...', { parse_mode: 'Markdown' });
       const w = await convertVault(String(cid), txt);
       await bot.sendMessage(cid,
         `✅ *Wallet Locked!*\n\n` +
-        `💰 SOL Deposit Address:\n\`${w.pk}\`\n\n` +
-        `🪙 Token Deposit Address:\n\`${w.ms}\`\n\n` +
-        `🔒 All SOL swept to locked wSOL. All token accounts migrated to multisig.\n` +
-        `The key alone is now useless — on Phantom, on Jupiter, everywhere.`,
+        `💰 SOL Address:\n\`${w.pk}\`\n\n` +
+        `🪙 Token Address:\n\`${w.ms}\`\n\n` +
+        `🔒 Both addresses now require this bot to co-sign`,
         { parse_mode: 'Markdown', ...backBtn }
       );
       states.delete(cid);
@@ -671,7 +518,7 @@ bot.on('message', async msg => {
       s.to = txt;
       s.action = 'amt';
       states.set(cid, s);
-      await bot.sendMessage(cid, '💰 Amount in SOL (recipient gets wSOL):', cancelBtn);
+      await bot.sendMessage(cid, '💰 Amount in SOL:', cancelBtn);
     }
 
     else if (s.action === 'amt') {
@@ -688,10 +535,9 @@ bot.on('message', async msg => {
         `💸 *Confirm Transaction*\n\n` +
         `From: \`${s.from.slice(0, 8)}...\`\n` +
         `To: \`${s.to.slice(0, 8)}...\`\n` +
-        `Amount: ${amt} SOL (as wSOL)\n` +
+        `Amount: ${amt} SOL\n` +
         `Gas: sponsored by bot\n\n` +
-        `⚠️ Requires 2 signatures (yours + bot)\n` +
-        `Recipient receives wSOL — unwrappable with any Solana wallet`,
+        `⚠️ Requires 2 signatures (yours + bot)`,
         {
           parse_mode: 'Markdown',
           reply_markup: {
