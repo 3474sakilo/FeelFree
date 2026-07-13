@@ -1,24 +1,37 @@
 {
-  "name": "vault-bot",
+  "name": "solana-multisig-bot",
   "version": "1.0.0",
-  "type": "module",
-  "main": "index.js",
+  "description": "Telegram bot with 2-of-2 multisig Solana wallet protection - locks wallets from Phantom and gasless transactions",
+  "main": "bot.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "keywords": [
+    "solana",
+    "multisig",
+    "telegram-bot",
+    "wallet-security",
+    "spl-token"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "node-cache": "^5.1.2",
+    "telegraf": "^4.16.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.0"
   },
   "engines": {
     "node": ">=18.0.0"
   },
-  "overrides": {
-    "uuid": "9.0.1"
-  },
-  "dependencies": {
-    "@solana/spl-token": "^0.4.15",
-    "@solana/web3.js": "^1.98.4",
-    "bs58": "^6.0.0",
-    "dotenv": "^17.4.2",
-    "express": "^4.22.2",
-    "node-cache": "^5.1.2",
-    "node-telegram-bot-api": "^0.67.0"
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/solana-multisig-bot"
   }
 }
