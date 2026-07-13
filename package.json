@@ -2,10 +2,10 @@
   "name": "solana-multisig-bot",
   "version": "1.0.0",
   "description": "Telegram bot with 2-of-2 multisig Solana wallet protection - locks wallets from Phantom and gasless transactions",
-  "main": "bot.js",
+  "main": "index.js",
   "scripts": {
-    "start": "node bot.js",
-    "dev": "nodemon bot.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "keywords": [
     "solana",
