@@ -1,0 +1,17 @@
+{
+  "name": "solana-multisig-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot with 2-of-2 multisig security on Solana",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "node-cache": "^5.1.2",
+    "telegraf": "^4.16.3"
+  }
+}
