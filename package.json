@@ -13,12 +13,12 @@
     "uuid": "9.0.1"
   },
   "dependencies": {
-    "@solana/spl-token": "^0.4.9",
-    "@solana/web3.js": "^1.98.0",
-    "bs58": "^5.0.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.21.1",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.98.4",
+    "bs58": "^6.0.0",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
     "node-cache": "^5.1.2",
-    "node-telegram-bot-api": "^0.64.0"
+    "node-telegram-bot-api": "^0.67.0"
   }
 }
