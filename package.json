@@ -1,26 +1,44 @@
 {
-  "name": "solana-vault-bot",
+  "name": "vault-bot",
   "version": "1.0.0",
-  "description": "Solana 2-of-2 multisig vault Telegram bot",
-  "main": "index.js",
   "type": "module",
+  "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js"
+    "start": "node index.js"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "@solana/spl-token": "^0.4.8",
-    "@solana/web3.js": "^1.95.4",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.0",
     "bs58": "^5.0.0",
     "dotenv": "^16.4.5",
-    "express": "^4.21.0",
+    "express": "^4.21.1",
     "node-cache": "^5.1.2",
-    "node-telegram-bot-api": "^0.66.0"
-  },
-  "devDependencies": {
-    "nodemon": "^3.1.4"
+    "node-telegram-bot-api": "^0.64.0"
   }
 }
+```
+
+---
+
+**Why each version is pinned this way:**
+
+| Package | Version | Reason |
+|---|---|---|
+| `@solana/spl-token` | `^0.4.9` | 0.4.x exports `NATIVE_MINT`, `createSyncNativeInstruction`, `createSetAuthorityInstruction`, `AuthorityType` — all required by the new code |
+| `@solana/web3.js` | `^1.98.0` | Must stay on v1.x — v2 is a complete rewrite with a different API that would break every import |
+| `bs58` | `^5.0.0` | v5 has a default export (`import bs58 from 'bs58'` then `bs58.decode()`) — v6 switched to named-only exports which would crash on startup |
+| `dotenv` | `^16.4.5` | v16 supports `import 'dotenv/config'` syntax used at the top of index.js |
+| `express` | `^4.21.1` | Stable v4, v5 is still RC |
+| `node-cache` | `^5.1.2` | Current stable, no breaking changes expected |
+| `node-telegram-bot-api` | `^0.64.0` | Latest stable with working polling mode |
+
+---
+
+**Before pushing to GitHub — create a `.gitignore`** so your secrets never end up in the repo:
+
+```
+node_modules/
+.env
