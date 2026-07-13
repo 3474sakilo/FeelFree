@@ -1,714 +1,598 @@
-import 'dotenv/config';
-import express from 'express';
-import TelegramBot from 'node-telegram-bot-api';
-import {
-  Keypair, Connection, PublicKey, LAMPORTS_PER_SOL,
-  TransactionMessage, VersionedTransaction, SystemProgram
-} from '@solana/web3.js';
-import {
-  getAssociatedTokenAddress, createTransferInstruction,
-  createAssociatedTokenAccountInstruction, TOKEN_PROGRAM_ID,
-  createInitializeMultisigInstruction, MULTISIG_SIZE,
-  NATIVE_MINT, createSyncNativeInstruction,
-  createSetAuthorityInstruction, AuthorityType
-} from '@solana/spl-token';
-import bs58 from 'bs58';
-import crypto from 'crypto';
-import NodeCache from 'node-cache';
+require('dotenv').config();
+const { Telegraf, Markup } = require('telegraf');
+const {
+  Connection, Keypair, PublicKey, SystemProgram, Transaction,
+  LAMPORTS_PER_SOL, sendAndConfirmTransaction
+} = require('@solana/web3.js');
+const {
+  getAssociatedTokenAddress, createAssociatedTokenAccountInstruction,
+  createTransferInstruction, createSyncNativeInstruction,
+  createCloseAccountInstruction, getAccount, TOKEN_PROGRAM_ID, 
+  NATIVE_MINT, createInitializeMultisigInstruction, 
+  createSetAuthorityInstruction, AuthorityType, 
+  getOrCreateAssociatedTokenAccount
+} = require('@solana/spl-token');
+const bs58 = require('bs58');
+const NodeCache = require('node-cache');
 
-// ===== CONFIG =====
-const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const KEY = process.env.FEE_PAYER_PRIVATE_KEY;
-const RPC = process.env.RPC_URL || 'https://api.mainnet-beta.solana.com';
-const PORT = process.env.PORT || 3000;
+// Config
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const FEE_PAYER_PRIVATE_KEY = process.env.FEE_PAYER_PRIVATE_KEY;
+const RPC_ENDPOINT = process.env.RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 
-if (!TOKEN || !KEY) {
-  console.log('ERROR: Missing env vars');
+if (!BOT_TOKEN || !FEE_PAYER_PRIVATE_KEY) {
+  console.error('Missing BOT_TOKEN or FEE_PAYER_PRIVATE_KEY');
   process.exit(1);
 }
 
-// ===== EXPRESS =====
-const app = express();
-app.get('/', (_, r) => r.send('OK'));
-app.listen(PORT, '0.0.0.0', () => console.log(`WEB:${PORT}`));
-
-// ===== FEE PAYER =====
-let feePayer;
+// Solana setup
+const conn = new Connection(RPC_ENDPOINT, 'confirmed');
+let feePayerSecretKey;
 try {
-  const k = KEY.trim();
-  feePayer = k.startsWith('[')
-    ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(k)))
-    : Keypair.fromSecretKey(bs58.decode(k));
+  feePayerSecretKey = Uint8Array.from(JSON.parse(FEE_PAYER_PRIVATE_KEY));
 } catch {
-  console.log('BAD KEY');
-  process.exit(1);
+  feePayerSecretKey = bs58.decode(FEE_PAYER_PRIVATE_KEY);
 }
+const feePayer = Keypair.fromSecretKey(feePayerSecretKey);
 
-const FPA = feePayer.publicKey.toBase58();
-const MAINNET = RPC.includes('mainnet');
-const conn = new Connection(RPC, 'confirmed');
-console.log(`FEE:${FPA.slice(0, 8)} NET:${MAINNET ? 'MAIN' : 'DEV'}`);
+// Cache
+const walletCache = new NodeCache({ stdTTL: 3600 });
+const sessions = new NodeCache({ stdTTL: 600 });
 
-conn.getBalance(feePayer.publicKey).then(b => {
-  console.log(`FEE_PAYER_BAL: ${(b / LAMPORTS_PER_SOL).toFixed(6)} SOL`);
-  if (b < 0.01 * LAMPORTS_PER_SOL)
-    console.warn(`WARNING: fee payer balance is very low — fund ${FPA} or vault creation will fail`);
-}).catch(() => {});
-
-// ===== STORAGE =====
-const cache = new NodeCache({ stdTTL: 0 });
-const txCache = new NodeCache({ stdTTL: 300 });
-const used = new Map();
-
-setInterval(() => {
-  const n = Date.now();
-  for (const [k, v] of used) if (n - v > 300000) used.delete(k);
-}, 60000);
-
-// ===== TX HELPER =====
-async function sendAndConfirm(tx, blockhash, lastValidBlockHeight) {
-  try {
-    const sig = await conn.sendTransaction(tx, { maxRetries: 3 });
-    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight });
-    return sig;
-  } catch (e) {
-    const logs = e?.logs ?? (typeof e?.getLogs === 'function' ? await e.getLogs(conn).catch(() => []) : []);
-    if (logs?.length) throw new Error('TX failed:\n' + logs.join('\n'));
-    throw e;
-  }
-}
-
-// ===== MULTISIG HELPER =====
-async function createMultisigOnChain(userPublicKey) {
-  const [rent, fpBal] = await Promise.all([
-    conn.getMinimumBalanceForRentExemption(MULTISIG_SIZE),
-    conn.getBalance(feePayer.publicKey)
-  ]);
-
-  const needed = rent + 5000;
-  if (fpBal < needed) {
-    throw new Error(
-      `Fee payer needs at least ${(needed / LAMPORTS_PER_SOL).toFixed(6)} SOL to create a vault.\n` +
-      `Current balance: ${(fpBal / LAMPORTS_PER_SOL).toFixed(6)} SOL\n` +
-      `Fund this address: ${FPA}`
-    );
-  }
-
+// Create multisig
+async function createMultisig(userPubkey) {
   const ms = Keypair.generate();
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-
-  const tx = new VersionedTransaction(
-    new TransactionMessage({
-      payerKey: feePayer.publicKey,
-      recentBlockhash: blockhash,
-      instructions: [
-        SystemProgram.createAccount({
-          fromPubkey: feePayer.publicKey,
-          newAccountPubkey: ms.publicKey,
-          lamports: rent,
-          space: MULTISIG_SIZE,
-          programId: TOKEN_PROGRAM_ID
-        }),
-        createInitializeMultisigInstruction(
-          ms.publicKey,
-          [userPublicKey, feePayer.publicKey],
-          2
-        )
-      ]
-    }).compileToV0Message()
+  const rent = await conn.getMinimumBalanceForRentExemption(355);
+  
+  const tx = new Transaction().add(
+    SystemProgram.createAccount({
+      fromPubkey: feePayer.publicKey,
+      newAccountPubkey: ms.publicKey,
+      lamports: rent,
+      space: 355,
+      programId: TOKEN_PROGRAM_ID,
+    }),
+    createInitializeMultisigInstruction(ms.publicKey, [userPubkey, feePayer.publicKey], 2)
   );
-
-  tx.sign([feePayer, ms]);
-  await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
-  return ms.publicKey;
+  
+  tx.feePayer = feePayer.publicKey;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(ms, feePayer);
+  
+  const sig = await conn.sendRawTransaction(tx.serialize());
+  await conn.confirmTransaction(sig, 'confirmed');
+  return ms;
 }
 
-// ===== SWEEP NATIVE SOL → wSOL IN MULTISIG VAULT =====
-// Moves all native SOL from userKeypair's address into a wSOL token account
-// owned by the 2-of-2 multisig. After this, the user's keypair address holds
-// ~0 lamports, so Phantom / gasless services have nothing to spend.
-async function sweepSolToVault(userKeypair, msPublicKey) {
-  const balance = await conn.getBalance(userKeypair.publicKey);
-  const sweepable = balance - 5000; // keep just enough for this tx's fee
-  if (sweepable <= 0) return;
-
-  const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, msPublicKey, true);
+// Sweep SOL to wSOL
+async function sweepSolToVaultSafe(userKP, msPubkey) {
+  const bal = await conn.getBalance(userKP.publicKey);
+  const sweepable = bal - 10000;
+  if (sweepable <= 0) return 0;
+  
+  const tempWsol = await getAssociatedTokenAddress(NATIVE_MINT, userKP.publicKey);
+  const tempExists = await conn.getAccountInfo(tempWsol).catch(() => null);
+  
   const ixs = [];
-
-  if (!(await conn.getAccountInfo(wsolAta).catch(() => null))) {
-    ixs.push(createAssociatedTokenAccountInstruction(
-      feePayer.publicKey, wsolAta, msPublicKey, NATIVE_MINT
-    ));
-  }
-
-  // Transfer lamports into the wSOL ATA, then syncNative so token balance matches
-  ixs.push(SystemProgram.transfer({
-    fromPubkey: userKeypair.publicKey,
-    toPubkey: wsolAta,
-    lamports: sweepable
-  }));
-  ixs.push(createSyncNativeInstruction(wsolAta));
-
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const tx = new VersionedTransaction(
-    new TransactionMessage({
-      payerKey: feePayer.publicKey,
-      recentBlockhash: blockhash,
-      instructions: ixs
-    }).compileToV0Message()
-  );
-  tx.sign([feePayer, userKeypair]);
-  await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
-}
-
-// ===== MIGRATE EXISTING TOKEN ACCOUNTS TO MULTISIG AUTHORITY =====
-// Changes AccountOwner authority on all SPL token accounts from the user's
-// keypair to the multisig. A single key can no longer move any token.
-async function migrateTokenAccounts(userKeypair, msPublicKey) {
-  const accts = await conn.getParsedTokenAccountsByOwner(
-    userKeypair.publicKey, { programId: TOKEN_PROGRAM_ID }
-  ).catch(() => ({ value: [] }));
-
-  if (!accts.value.length) return;
-
-  const BATCH = 10;
-  for (let i = 0; i < accts.value.length; i += BATCH) {
-    const batch = accts.value.slice(i, i + BATCH);
-    const ixs = batch.map(t =>
-      createSetAuthorityInstruction(
-        new PublicKey(t.pubkey),
-        userKeypair.publicKey,
-        AuthorityType.AccountOwner,
-        msPublicKey,
-        [],
-        TOKEN_PROGRAM_ID
+  if (!tempExists) {
+    ixs.push(
+      createAssociatedTokenAccountInstruction(
+        feePayer.publicKey, tempWsol, userKP.publicKey, NATIVE_MINT
       )
     );
+  }
+  
+  ixs.push(
+    SystemProgram.transfer({
+      fromPubkey: userKP.publicKey,
+      toPubkey: tempWsol,
+      lamports: sweepable,
+    }),
+    createSyncNativeInstruction(tempWsol)
+  );
+  
+  const msWsolAta = await getOrCreateAssociatedTokenAccount(
+    conn, feePayer, NATIVE_MINT, msPubkey, true
+  );
+  
+  ixs.push(
+    createTransferInstruction(
+      tempWsol, msWsolAta.address, userKP.publicKey, sweepable, [userKP.publicKey]
+    )
+  );
+  
+  const tx = new Transaction().add(...ixs);
+  tx.feePayer = feePayer.publicKey;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(userKP, feePayer);
+  
+  const sig = await conn.sendRawTransaction(tx.serialize());
+  await conn.confirmTransaction(sig, 'confirmed');
+  return sweepable;
+}
 
-    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-    const tx = new VersionedTransaction(
-      new TransactionMessage({
-        payerKey: feePayer.publicKey,
-        recentBlockhash: blockhash,
-        instructions: ixs
-      }).compileToV0Message()
+// Withdraw wSOL to native SOL - NEW FUNCTION
+async function withdrawWsolToNative(userKP, msPubkey, recipientPubkey, amount) {
+  const msWsolAta = await getAssociatedTokenAddress(NATIVE_MINT, msPubkey, true);
+  const recipientWsolAta = await getOrCreateAssociatedTokenAccount(
+    conn, feePayer, NATIVE_MINT, recipientPubkey
+  );
+  
+  // Step 1: Transfer wSOL from multisig to recipient's wSOL account
+  const transferIx = createTransferInstruction(
+    msWsolAta,
+    recipientWsolAta.address,
+    msPubkey,
+    BigInt(amount),
+    [userKP.publicKey, feePayer.publicKey],
+    TOKEN_PROGRAM_ID
+  );
+  
+  // Step 2: Close recipient's wSOL account to unwrap to native SOL
+  const closeIx = createCloseAccountInstruction(
+    recipientWsolAta.address,
+    recipientPubkey,
+    recipientPubkey,
+    [],
+    TOKEN_PROGRAM_ID
+  );
+  
+  const tx = new Transaction().add(transferIx, closeIx);
+  tx.feePayer = feePayer.publicKey;
+  tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+  tx.sign(userKP, feePayer);
+  
+  const sig = await conn.sendRawTransaction(tx.serialize());
+  await conn.confirmTransaction(sig, 'confirmed');
+  return sig;
+}
+
+// Migrate token authorities
+async function migrateTokens(userKP, msPubkey) {
+  const accounts = await conn.getParsedTokenAccountsByOwner(userKP.publicKey, { programId: TOKEN_PROGRAM_ID });
+  if (!accounts.value.length) return;
+  
+  for (let i = 0; i < accounts.value.length; i += 15) {
+    const batch = accounts.value.slice(i, i + 15);
+    const ixs = batch.map(({ pubkey }) =>
+      createSetAuthorityInstruction(pubkey, userKP.publicKey, AuthorityType.AccountOwner, msPubkey)
     );
-    tx.sign([feePayer, userKeypair]);
-    await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
+    
+    const tx = new Transaction().add(...ixs);
+    tx.feePayer = feePayer.publicKey;
+    tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+    tx.sign(userKP, feePayer);
+    
+    const sig = await conn.sendRawTransaction(tx.serialize());
+    await conn.confirmTransaction(sig, 'confirmed');
   }
 }
 
-// ===== VAULT =====
-async function createVault(uid) {
-  const seed = crypto.createHash('sha256').update(uid + Date.now() + Math.random()).digest();
-  const user = Keypair.fromSeed(seed.slice(0, 32));
-  const msPublicKey = await createMultisigOnChain(user.publicKey);
-
-  const w = {
-    pk: user.publicKey.toBase58(),
-    sk: bs58.encode(user.secretKey),
-    ms: msPublicKey.toBase58(),
-    uid: String(uid),
-    label: 'Vault-' + user.publicKey.toBase58().slice(0, 8),
-    fp: FPA
-  };
-  cache.set(w.pk, w);
-  return w;
-}
-
-async function convertVault(uid, pkey) {
-  let user;
+// Get wSOL balance
+async function getWsolBalance(msPubkey) {
   try {
-    const k = pkey.trim();
-    user = k.startsWith('[')
-      ? Keypair.fromSecretKey(Uint8Array.from(JSON.parse(k)))
-      : Keypair.fromSecretKey(bs58.decode(k));
-  } catch { throw new Error('Bad key format'); }
-
-  if (user.publicKey.toBase58() === FPA) throw new Error('Cannot convert fee payer');
-
-  // Step 1: create 2-of-2 multisig on-chain
-  const msPublicKey = await createMultisigOnChain(user.publicKey);
-
-  // Step 2: sweep native SOL → wSOL locked under multisig authority
-  await sweepSolToVault(user, msPublicKey);
-
-  // Step 3: transfer authority of all existing SPL token accounts to multisig
-  await migrateTokenAccounts(user, msPublicKey);
-
-  const w = {
-    pk: user.publicKey.toBase58(),
-    sk: bs58.encode(user.secretKey),
-    ms: msPublicKey.toBase58(),
-    uid: String(uid),
-    label: 'Vault-' + user.publicKey.toBase58().slice(0, 8),
-    fp: FPA
-  };
-  cache.set(w.pk, w);
-  return w;
-}
-
-// Wrap any fresh native SOL that arrived at the vault address since last sweep
-async function wrapVaultSol(pk) {
-  const w = cache.get(pk);
-  if (!w) throw new Error('Vault not found');
-  const user = Keypair.fromSecretKey(bs58.decode(w.sk));
-  const ms = new PublicKey(w.ms);
-  await sweepSolToVault(user, ms);
-}
-
-function getUserWallets(uid) {
-  return cache.keys().map(k => cache.get(k)).filter(w => w && w.uid === String(uid));
-}
-
-async function getVaultBal(pk) {
-  const w = cache.get(pk);
-  const p = new PublicKey(pk);
-
-  // Native SOL sitting at the vault address (unwrapped — NOT locked yet)
-  const nativeLamports = await conn.getBalance(p).catch(() => 0);
-
-  let wsolAmt = 0;
-  const tokens = [];
-
-  if (w?.ms) {
-    const msP = new PublicKey(w.ms);
-    const toks = await conn.getParsedTokenAccountsByOwner(msP, { programId: TOKEN_PROGRAM_ID })
-      .catch(() => ({ value: [] }));
-
-    for (const t of toks.value) {
-      const info = t.account.data.parsed.info;
-      if (info.mint === NATIVE_MINT.toBase58()) {
-        wsolAmt = info.tokenAmount.uiAmount ?? 0;
-      } else {
-        tokens.push({ mint: info.mint, amt: info.tokenAmount.uiAmount });
-      }
-    }
+    const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, msPubkey, true);
+    const account = await getAccount(conn, wsolAta);
+    return Number(account.amount);
+  } catch {
+    return 0;
   }
-
-  return {
-    sol: nativeLamports / LAMPORTS_PER_SOL, // unwrapped, needs wrap to be locked
-    wsol: wsolAmt,                           // locked wSOL in multisig vault
-    tokens
-  };
 }
 
-async function getBal(pk) {
-  const p = new PublicKey(pk);
-  const [sol, toks] = await Promise.all([
-    conn.getBalance(p).catch(() => 0),
-    conn.getParsedTokenAccountsByOwner(p, { programId: TOKEN_PROGRAM_ID }).catch(() => ({ value: [] }))
-  ]);
-  return {
-    sol: sol / LAMPORTS_PER_SOL,
-    tokens: toks.value.map(t => ({
-      mint: t.account.data.parsed.info.mint,
-      amt: t.account.data.parsed.info.tokenAmount.uiAmount
-    }))
-  };
-}
+// Bot
+const bot = new Telegraf(BOT_TOKEN);
+const menu = Markup.keyboard([
+  ['🔑 Convert Wallet', '🏦 My Vaults'],
+  ['💸 Send', '🏧 Withdraw'],
+  ['🔐 Wrap SOL', '❓ Help']
+]).resize();
 
-// ===== TRANSACTION BUILDER =====
-async function buildTx(from, to, amt, mint) {
-  const w = cache.get(from);
-  if (!w) throw new Error('Not found');
+bot.start(ctx => ctx.reply(
+  '🛡️ *Solana 2-of-2 Multisig Bot*\n\n' +
+  'Your funds are protected by multisig. Phantom & gasless wallets CANNOT move funds without bot approval.\n\n' +
+  '• SOL converted to wSOL (multisig controlled)\n' +
+  '• Tokens migrated to multisig authority\n' +
+  '• External wallets cannot spend\n' +
+  '• Withdraw to native SOL anytime',
+  { parse_mode: 'Markdown', ...menu }
+));
 
-  const fk = Keypair.fromSecretKey(bs58.decode(w.sk));
-  const ms = new PublicKey(w.ms);
-  const tp = new PublicKey(to);
-  const ixs = [];
-
-  if (mint) {
-    // SPL token transfer — source ATA owned by multisig
-    const mp = new PublicKey(mint);
-    const fa = await getAssociatedTokenAddress(mp, ms, true);
-    const ta = await getAssociatedTokenAddress(mp, tp);
-
-    if (!(await conn.getAccountInfo(ta).catch(() => null))) {
-      ixs.push(createAssociatedTokenAccountInstruction(feePayer.publicKey, ta, tp, mp));
-    }
-
-    ixs.push(createTransferInstruction(
-      fa, ta, ms, BigInt(amt),
-      [fk.publicKey, feePayer.publicKey]
-    ));
-  } else {
-    // SOL send — transfers wSOL from multisig vault, requires both signatures.
-    // User's keypair address has ~0 native SOL, so Phantom / gasless cannot
-    // bypass this path: there is nothing at an address the user controls alone.
-    const wsolSrc = await getAssociatedTokenAddress(NATIVE_MINT, ms, true);
-    const wsolDst = await getAssociatedTokenAddress(NATIVE_MINT, tp);
-    const lamports = BigInt(Math.floor(amt * LAMPORTS_PER_SOL));
-
-    if (!(await conn.getAccountInfo(wsolDst).catch(() => null))) {
-      ixs.push(createAssociatedTokenAccountInstruction(feePayer.publicKey, wsolDst, tp, NATIVE_MINT));
-    }
-
-    ixs.push(createTransferInstruction(
-      wsolSrc, wsolDst, ms, lamports,
-      [fk.publicKey, feePayer.publicKey]
-    ));
-  }
-
-  const { blockhash } = await conn.getLatestBlockhash();
-  const msg = new TransactionMessage({
-    payerKey: feePayer.publicKey,
-    recentBlockhash: blockhash,
-    instructions: ixs
-  }).compileToV0Message();
-
-  const tx = new VersionedTransaction(msg);
-  tx.sign([fk]);
-
-  const ser = Buffer.from(tx.serialize()).toString('base64');
-  const id = crypto.createHash('sha256').update(ser).digest('hex').slice(0, 16);
-  txCache.set(id, { ser, from, to, amt, mint: mint || null, ts: Date.now() });
-  return id;
-}
-
-async function submitTx(id) {
-  const d = txCache.get(id);
-  if (!d) throw new Error('Expired');
-
-  const tx = VersionedTransaction.deserialize(Buffer.from(d.ser, 'base64'));
-  const keys = tx.message.getAccountKeys();
-
-  if (keys.get(0).toBase58() !== FPA) throw new Error('Wrong bot');
-
-  for (const ix of tx.message.compiledInstructions) {
-    const prog = keys.get(ix.programIndex).toBase58();
-    if (prog === '11111111111111111111111111111111') {
-      const view = new DataView(ix.data.buffer, ix.data.byteOffset, ix.data.byteLength);
-      if (view.getUint32(0, true) === 2) {
-        if (keys.get(ix.accountKeyIndexes[0]).toBase58() === FPA) throw new Error('No drain');
-      }
-    }
-  }
-
-  const s = tx.signatures[0];
-  if (s) {
-    const sh = Buffer.from(s).toString('hex');
-    if (used.has(sh)) throw new Error('Duplicate');
-    used.set(sh, Date.now());
-  }
-
-  tx.sign([feePayer]);
-  const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash();
-  const sig = await sendAndConfirm(tx, blockhash, lastValidBlockHeight);
-  txCache.del(id);
-
-  return {
-    sig,
-    url: `https://solscan.io/tx/${sig}${MAINNET ? '' : '?cluster=devnet'}`
-  };
-}
-
-// ===== TELEGRAM BOT =====
-const bot = new TelegramBot(TOKEN, { polling: true });
-const states = new Map();
-
-const mainMenu = {
-  reply_markup: {
-    inline_keyboard: [
-      [{ text: '🔐 Create Vault', callback_data: 'create' }],
-      [{ text: '🔒 Convert Wallet', callback_data: 'convert' }],
-      [{ text: '💎 My Vaults', callback_data: 'wallets' }],
-      [{ text: '💸 Send', callback_data: 'send' }],
-      [{ text: '📊 Balance', callback_data: 'bal' }],
-      [{ text: '🔑 Keys', callback_data: 'keys' }],
-      [{ text: '⛽ Status', callback_data: 'status' }],
-      [{ text: '🆘 Help', callback_data: 'help' }]
-    ]
-  }
-};
-
-const backBtn = { reply_markup: { inline_keyboard: [[{ text: '🔙 Back', callback_data: 'main' }]] } };
-const cancelBtn = { reply_markup: { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cancel' }]] } };
-
-bot.onText(/\/start/, msg => {
-  bot.sendMessage(msg.chat.id,
-    '🔒 *VAULT BOT*\n\nWallets permanently locked to this bot.\n\n❌ Phantom ❌ Jupiter\n✅ Only this bot',
-    { parse_mode: 'Markdown', ...mainMenu }
-  ).catch(() => {});
+bot.hears('🔑 Convert Wallet', ctx => {
+  ctx.reply(
+    '🔐 *Convert Wallet to Vault*\n\n' +
+    'Send your private key (Base58 or JSON array format).\n\n' +
+    '⚠️ *This will:*\n' +
+    '• Create a 2-of-2 multisig vault\n' +
+    '• Convert all SOL to wrapped SOL (wSOL)\n' +
+    '• Transfer all token authority to multisig\n' +
+    '• Leave your wallet unable to transact without bot approval\n\n' +
+    'Your private key will NOT be stored after conversion.',
+    { parse_mode: 'Markdown' }
+  );
+  sessions.set(ctx.from.id, { action: 'convert' });
 });
 
-bot.on('callback_query', async q => {
-  const cid = q.message.chat.id;
-  const mid = q.message.message_id;
-  const d = q.data;
+bot.hears('🏦 My Vaults', async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  if (!vaults.length) return ctx.reply('📭 No vaults found. Use "🔑 Convert Wallet" to create one.', menu);
+  
+  let msg = '🔐 *Your Vaults*\n\n';
+  const btns = [];
+  
+  for (let i = 0; i < vaults.length; i++) {
+    const v = vaults[i];
+    const nativeBal = await conn.getBalance(v.pubkey);
+    const wsolBal = await getWsolBalance(v.msPubkey);
+    
+    msg += `*${i+1}. ${v.label}*\n`;
+    msg += `📍 \`${v.pubkey.toBase58().slice(0,8)}...\`\n`;
+    msg += `💎 wSOL: ${(wsolBal/1e9).toFixed(4)} (protected)\n`;
+    msg += `🪙 SOL: ${(nativeBal/LAMPORTS_PER_SOL).toFixed(4)} (sweepable)\n\n`;
+    
+    btns.push([Markup.button.callback(`📋 ${v.label}`, `v_${i}`)]);
+  }
+  
+  await ctx.reply(msg, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
+});
 
-  bot.answerCallbackQuery(q.id).catch(() => {});
+bot.hears('💸 Send', async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  if (!vaults.length) return ctx.reply('📭 No vaults available. Create one first!', menu);
+  
+  const btns = vaults.map((v, i) => [Markup.button.callback(`${v.label}`, `send_${i}`)]);
+  await ctx.reply('📤 *Select vault to send from:*', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
+});
 
-  const ed = (t, kb = {}) =>
-    bot.editMessageText(t, { chat_id: cid, message_id: mid, parse_mode: 'Markdown', ...kb }).catch(() => {});
+bot.hears('🏧 Withdraw', async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  if (!vaults.length) return ctx.reply('📭 No vaults available. Create one first!', menu);
+  
+  const btns = vaults.map((v, i) => [Markup.button.callback(`${v.label}`, `withdraw_${i}`)]);
+  await ctx.reply('🏧 *Withdraw to Native SOL*\n\nSelect vault to withdraw from:', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
+});
 
+bot.hears('🔐 Wrap SOL', async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  if (!vaults.length) return ctx.reply('📭 No vaults to wrap SOL for.', menu);
+  
+  const btns = [];
+  for (let i = 0; i < vaults.length; i++) {
+    const bal = await conn.getBalance(vaults[i].pubkey);
+    btns.push([Markup.button.callback(`${vaults[i].label} (${(bal/LAMPORTS_PER_SOL).toFixed(4)} SOL)`, `wrap_${i}`)]);
+  }
+  await ctx.reply('🔐 *Select vault to wrap SOL:*', { parse_mode: 'Markdown', ...Markup.inlineKeyboard(btns) });
+});
+
+bot.hears('❓ Help', ctx => {
+  ctx.reply(
+    '🛡️ *How It Works*\n\n' +
+    '*2-of-2 Multisig Security:*\n' +
+    '• Funds live in a multisig vault\n' +
+    '• Transactions require BOTH your key AND bot\'s key\n' +
+    '• Phantom wallet CANNOT move funds alone\n' +
+    '• Gasless wallets CANNOT bypass multisig\n\n' +
+    '*SOL Protection:*\n' +
+    '• Native SOL → wrapped SOL (wSOL)\n' +
+    '• wSOL requires multisig approval\n' +
+    '• Wallet holds only dust (~0.000005 SOL)\n\n' +
+    '*Commands:*\n' +
+    '🔑 Convert Wallet - Lock existing wallet\n' +
+    '🏦 My Vaults - View your vaults\n' +
+    '💸 Send - Transfer wSOL/tokens\n' +
+    '🏧 Withdraw - Unwrap wSOL to native SOL\n' +
+    '🔐 Wrap SOL - Protect native SOL',
+    { parse_mode: 'Markdown', ...menu }
+  );
+});
+
+// Callback handlers
+bot.action(/^v_(\d+)$/, async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  const v = vaults[parseInt(ctx.match[1])];
+  if (!v) return ctx.answerCbQuery('❌ Vault not found');
+  
+  const nativeBal = await conn.getBalance(v.pubkey);
+  const wsolBal = await getWsolBalance(v.msPubkey);
+  
+  const msg = 
+    `🔐 *${v.label}*\n\n` +
+    `📍 Wallet: \`${v.pubkey.toBase58()}\`\n` +
+    `🏦 Multisig: \`${v.msPubkey.toBase58()}\`\n\n` +
+    `💎 wSOL: ${(wsolBal/1e9).toFixed(6)} (protected)\n` +
+    `🪙 Native SOL: ${(nativeBal/LAMPORTS_PER_SOL).toFixed(6)} (sweepable)\n\n` +
+    `🔒 *Status: LOCKED*\n` +
+    `Phantom & gasless wallets cannot spend`;
+  
+  await ctx.reply(msg, {
+    parse_mode: 'Markdown',
+    ...Markup.inlineKeyboard([
+      [Markup.button.callback('📤 Send wSOL', `swsol_${ctx.match[1]}`),
+       Markup.button.callback('🏧 Withdraw SOL', `withdraw_${ctx.match[1]}`)],
+      [Markup.button.callback('🔐 Wrap SOL', `wrap_${ctx.match[1]}`)]
+    ])
+  });
+  await ctx.answerCbQuery();
+});
+
+bot.action(/^send_(\d+)$/, ctx => {
+  sessions.set(ctx.from.id, { action: 'send_recipient', vaultIdx: parseInt(ctx.match[1]) });
+  ctx.reply('📤 Send recipient address:', Markup.forceReply());
+  ctx.answerCbQuery();
+});
+
+bot.action(/^swsol_(\d+)$/, ctx => {
+  sessions.set(ctx.from.id, { action: 'wsol_recipient', vaultIdx: parseInt(ctx.match[1]) });
+  ctx.reply('📤 Send wSOL recipient address:', Markup.forceReply());
+  ctx.answerCbQuery();
+});
+
+bot.action(/^withdraw_(\d+)$/, ctx => {
+  sessions.set(ctx.from.id, { action: 'withdraw_recipient', vaultIdx: parseInt(ctx.match[1]) });
+  ctx.reply(
+    '🏧 *Withdraw to Native SOL*\n\n' +
+    'Send the recipient address to receive native SOL:',
+    { parse_mode: 'Markdown', ...Markup.forceReply() }
+  );
+  ctx.answerCbQuery();
+});
+
+bot.action(/^wrap_(\d+)$/, async ctx => {
+  const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+  const v = vaults[parseInt(ctx.match[1])];
+  if (!v) return ctx.answerCbQuery('❌ Vault not found');
+  
+  await ctx.answerCbQuery('⏳ Wrapping SOL...');
+  const msg = await ctx.reply('⏳ Wrapping native SOL to wSOL...');
+  
   try {
-    if (d === 'main') return ed('🔒 *VAULT BOT*\n\nWallets permanently locked to this bot.', mainMenu);
-
-    if (d === 'create') {
-      await ed('⏳ Creating vault on-chain...', {});
-      const w = await createVault(String(cid));
-      await ed(
-        `✅ *Vault Created!*\n\n` +
-        `💰 *Deposit SOL here:*\n\`${w.pk}\`\n\n` +
-        `🪙 *Deposit SPL tokens here:*\n\`${w.ms}\`\n\n` +
-        `🔑 *Private Key:*\n\`${w.sk}\`\n\n` +
-        `⚠️ After depositing SOL, open the vault and tap *Wrap SOL → Lock* to enforce the multisig.\n` +
-        `Key alone is useless — this bot must co-sign every transaction`,
-        backBtn
+    const swept = await sweepSolToVaultSafe(v.kp, v.msPubkey);
+    if (swept === 0) {
+      await ctx.telegram.editMessageText(msg.chat.id, msg.message_id, null, 
+        'ℹ️ No SOL to wrap. Native balance is at minimum.'
+      );
+    } else {
+      await ctx.telegram.editMessageText(msg.chat.id, msg.message_id, null,
+        `✅ Successfully wrapped ${(swept/LAMPORTS_PER_SOL).toFixed(6)} SOL to wSOL!\n\n🔒 Protected by multisig - Phantom cannot spend this.`
       );
     }
-
-    else if (d === 'convert') {
-      states.set(cid, { action: 'convert' });
-      await ed(
-        '🔒 Send your private key to lock it to this bot:\n\n' +
-        '⚠️ *All SOL and tokens will be swept into the vault multisig immediately.*\n' +
-        'After conversion the key is useless without the bot — on Phantom, on Jupiter, everywhere.',
-        cancelBtn
-      );
-    }
-
-    else if (d === 'wallets') {
-      const ws = getUserWallets(String(cid));
-      if (!ws.length) return ed('No vaults', backBtn);
-
-      let t = '*Your Vaults*\n\n';
-      const btns = [];
-      for (const w of ws) {
-        const b = await getVaultBal(w.pk);
-        const total = b.wsol + b.sol;
-        t += `${w.label}\n\`${w.pk.slice(0, 12)}...\`\n${total.toFixed(4)} SOL\n\n`;
-        btns.push([{ text: w.label, callback_data: `det_${w.pk}` }]);
-      }
-      btns.push([{ text: '🔙 Back', callback_data: 'main' }]);
-      await ed(t, { reply_markup: { inline_keyboard: btns } });
-    }
-
-    else if (d === 'send') {
-      const ws = getUserWallets(String(cid));
-      if (!ws.length) return ed('No vaults', backBtn);
-      const btns = ws.map(w => [{ text: w.label, callback_data: `sf_${w.pk}` }]);
-      btns.push([{ text: '🔙 Back', callback_data: 'main' }]);
-      await ed('Select vault to send from:', { reply_markup: { inline_keyboard: btns } });
-    }
-
-    else if (d === 'bal') {
-      states.set(cid, { action: 'bal' });
-      await ed('Send address to check:', cancelBtn);
-    }
-
-    else if (d === 'keys') {
-      const ws = getUserWallets(String(cid));
-      if (!ws.length) return ed('No vaults', backBtn);
-      const btns = ws.map(w => [{ text: w.label, callback_data: `ex_${w.pk}` }]);
-      btns.push([{ text: '🔙 Back', callback_data: 'main' }]);
-      await ed('Select vault:', { reply_markup: { inline_keyboard: btns } });
-    }
-
-    else if (d === 'status') {
-      const b = await conn.getBalance(feePayer.publicKey).catch(() => 0);
-      await ed(
-        `⛽ *Status*\n\nFee Payer: \`${FPA.slice(0, 12)}...\`\nBalance: ${(b / LAMPORTS_PER_SOL).toFixed(4)} SOL\nVaults: ${cache.keys().length}`,
-        backBtn
-      );
-    }
-
-    else if (d === 'help') {
-      await ed(
-        '*HOW THE VAULT WORKS*\n\n' +
-        '2-of-2 multisig enforced on-chain:\n\n' +
-        '✅ Your key + this bot = transaction executes\n' +
-        '❌ Your key alone = rejected by Solana network\n' +
-        '❌ Phantom = no bot co-signature → fails on-chain\n' +
-        '❌ Jupiter = no bot co-signature → fails on-chain\n' +
-        '❌ Gasless services = no funds at user address → nothing to send\n' +
-        '❌ Other bots = wrong fee payer key → fails\n\n' +
-        '*SOL is locked as wSOL:*\n' +
-        '1. Deposit native SOL to the SOL Address\n' +
-        '2. Tap "Wrap SOL → Lock" — SOL moves into multisig wSOL account\n' +
-        '3. Single-key transfers are now impossible on-chain\n\n' +
-        '*SPL tokens:* deposit to Token Address — already locked\n\n' +
-        '*Recipient gets wSOL* (unwrappable with any Solana wallet)',
-        backBtn
-      );
-    }
-
-    else if (d.startsWith('det_')) {
-      const pk = d.slice(4);
-      const w = cache.get(pk);
-      if (!w) return ed('Not found', backBtn);
-      const b = await getVaultBal(pk);
-
-      const tokenLines = b.tokens.length
-        ? b.tokens.map(t => `${t.amt} \`${t.mint.slice(0, 8)}...\``).join('\n')
-        : '_none_';
-
-      const unwrappedLine = b.sol > 0.000001
-        ? `\n⚠️ *Unwrapped:* ${b.sol.toFixed(6)} SOL (tap Wrap to lock)`
-        : '';
-
-      await ed(
-        `*${w.label}*\n\n` +
-        `💰 *SOL Deposit Address:*\n\`${w.pk}\`\n` +
-        `🔒 Locked wSOL: ${b.wsol.toFixed(4)} SOL${unwrappedLine}\n\n` +
-        `🪙 *Token Deposit Address:*\n\`${w.ms}\`\n${tokenLines}`,
-        {
-          reply_markup: {
-            inline_keyboard: [
-              [{ text: '💸 Send wSOL', callback_data: `sf_${pk}` }],
-              [{ text: '🔄 Wrap SOL → Lock', callback_data: `wv_${pk}` }],
-              [{ text: '🔑 Show Key', callback_data: `ex_${pk}` }],
-              [{ text: '📋 Copy SOL Addr', callback_data: `cp_${pk}` }],
-              [{ text: '📋 Copy Token Addr', callback_data: `cpm_${pk}` }],
-              [{ text: '🔙 Back', callback_data: 'wallets' }]
-            ]
-          }
-        }
-      );
-    }
-
-    else if (d.startsWith('wv_')) {
-      const pk = d.slice(3);
-      await ed('⏳ Wrapping SOL into vault...', {});
-      await wrapVaultSol(pk);
-      const b = await getVaultBal(pk);
-      await ed(
-        `✅ *SOL Wrapped & Locked*\n\n` +
-        `🔒 Locked wSOL: ${b.wsol.toFixed(4)} SOL\n` +
-        `Remaining native: ${b.sol.toFixed(6)} SOL\n\n` +
-        `Funds can only be moved by this bot.`,
-        backBtn
-      );
-    }
-
-    else if (d.startsWith('sf_')) {
-      states.set(cid, { action: 'to', from: d.slice(3) });
-      await ed('Enter recipient address:', cancelBtn);
-    }
-
-    else if (d.startsWith('ex_')) {
-      const w = cache.get(d.slice(3));
-      if (w) await ed(
-        `🔑 *Private Key*\n\n\`${w.sk}\`\n\n⚠️ Useless without this bot's co-signature\n🗑️ Delete this message after saving`,
-        backBtn
-      );
-    }
-
-    else if (d.startsWith('cp_')) {
-      await ed(`\`${d.slice(3)}\``, backBtn);
-    }
-
-    else if (d.startsWith('cpm_')) {
-      const w = cache.get(d.slice(4));
-      if (w) await ed(`\`${w.ms}\``, backBtn);
-    }
-
-    else if (d.startsWith('cf_')) {
-      const id = d.slice(3);
-      const s = states.get(cid);
-      if (!s || s.txId !== id) { await ed('Expired', backBtn); states.delete(cid); return; }
-
-      await ed('⏳ Signing and sending...', {});
-      const r = await submitTx(id);
-      await ed(`✅ *Sent!*\n\n[View on Solscan](${r.url})\n\n${s.amt} SOL (wSOL) sent\nGas sponsored by bot`, backBtn);
-      states.delete(cid);
-    }
-
-    else if (d === 'cancel') {
-      states.delete(cid);
-      await ed('🔒 *VAULT BOT*', mainMenu);
-    }
-
-  } catch (e) {
-    await ed('❌ ' + e.message, backBtn).catch(() => {});
+  } catch(e) {
+    await ctx.telegram.editMessageText(msg.chat.id, msg.message_id, null, 
+      `❌ Error: ${e.message}`
+    );
   }
 });
 
-bot.on('message', async msg => {
-  const cid = msg.chat.id;
-  const txt = msg.text;
-  if (!txt) return;
-
-  const s = states.get(cid);
-  if (!s) return;
-
-  if (txt === '❌ Cancel') {
-    states.delete(cid);
-    return bot.sendMessage(cid, '🔒 *VAULT BOT*', { parse_mode: 'Markdown', ...mainMenu }).catch(() => {});
+// Text message handler
+bot.on('text', async ctx => {
+  const session = sessions.get(ctx.from.id);
+  if (!session) return;
+  const text = ctx.message.text.trim();
+  
+  if (session.action === 'convert') {
+    try {
+      let secretKey;
+      try { 
+        secretKey = Uint8Array.from(JSON.parse(text)); 
+      } catch { 
+        secretKey = bs58.decode(text); 
+      }
+      
+      const userKP = Keypair.fromSecretKey(secretKey);
+      if (userKP.publicKey.equals(feePayer.publicKey)) {
+        return ctx.reply('❌ Cannot convert the fee payer account!');
+      }
+      
+      const statusMsg = await ctx.reply('⏳ Converting wallet to vault...\n\nStep 1/3: Creating multisig...');
+      
+      const msKP = await createMultisig(userKP.publicKey);
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        '⏳ Converting wallet to vault...\n\n✅ Step 1/3: Multisig created\n⏳ Step 2/3: Wrapping SOL...'
+      );
+      
+      await sweepSolToVaultSafe(userKP, msKP.publicKey);
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        '⏳ Converting wallet to vault...\n\n✅ Step 1/3: Multisig created\n✅ Step 2/3: SOL wrapped\n⏳ Step 3/3: Migrating tokens...'
+      );
+      
+      await migrateTokens(userKP, msKP.publicKey);
+      
+      const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+      vaults.push({ 
+        label: `Vault ${vaults.length+1}`, 
+        pubkey: userKP.publicKey, 
+        msPubkey: msKP.publicKey, 
+        kp: userKP, 
+        msKP 
+      });
+      walletCache.set(`v_${ctx.from.id}`, vaults);
+      sessions.del(ctx.from.id);
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        `✅ *Wallet Converted Successfully!*\n\n` +
+        `🔑 Vault: \`${userKP.publicKey.toBase58()}\`\n` +
+        `🏦 Multisig: \`${msKP.publicKey.toBase58()}\`\n\n` +
+        `🔒 *Security Active:*\n` +
+        `• SOL → wSOL (multisig protected)\n` +
+        `• Tokens → multisig authority\n` +
+        `• Phantom CANNOT spend\n` +
+        `• Gasless wallets CANNOT bypass\n` +
+        `• Use "🏧 Withdraw" to get native SOL\n\n` +
+        `⚠️ Keep your private key safe! You still need it to sign transactions.`,
+        { parse_mode: 'Markdown', ...menu }
+      );
+      
+    } catch(e) {
+      sessions.del(ctx.from.id);
+      ctx.reply(`❌ *Conversion failed:*\n${e.message}`, { parse_mode: 'Markdown', ...menu });
+    }
+    return;
   }
-
-  try {
-    if (s.action === 'convert') {
-      await bot.sendMessage(cid,
-        '⏳ Locking wallet on-chain...\n\nSweeping SOL to wSOL and migrating token accounts — this may take a moment.',
+  
+  if (session.action === 'send_recipient' || session.action === 'wsol_recipient') {
+    try {
+      const recipient = new PublicKey(text);
+      sessions.set(ctx.from.id, { ...session, action: 'send_amount', recipient });
+      ctx.reply('💎 Enter amount to send:', Markup.forceReply());
+    } catch { 
+      ctx.reply('❌ Invalid address. Please try again.'); 
+    }
+    return;
+  }
+  
+  if (session.action === 'withdraw_recipient') {
+    try {
+      const recipient = new PublicKey(text);
+      sessions.set(ctx.from.id, { ...session, action: 'withdraw_amount', recipient });
+      
+      const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+      const v = vaults[session.vaultIdx];
+      const wsolBal = await getWsolBalance(v.msPubkey);
+      
+      ctx.reply(
+        `🏧 *Withdraw to Native SOL*\n\n` +
+        `Available wSOL: ${(wsolBal/1e9).toFixed(6)}\n` +
+        `Recipient: \`${recipient.toBase58()}\`\n\n` +
+        `Enter amount to withdraw:`,
+        { parse_mode: 'Markdown', ...Markup.forceReply() }
+      );
+    } catch { 
+      ctx.reply('❌ Invalid address. Please try again.'); 
+    }
+    return;
+  }
+  
+  if (session.action === 'send_amount') {
+    const amount = parseFloat(text);
+    if (isNaN(amount) || amount <= 0) return ctx.reply('❌ Invalid amount. Enter a positive number.');
+    
+    const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+    const v = vaults[session.vaultIdx];
+    if (!v) { 
+      sessions.del(ctx.from.id); 
+      return ctx.reply('❌ Vault not found.', menu); 
+    }
+    
+    const statusMsg = await ctx.reply('⏳ Building transaction...');
+    
+    try {
+      const wsolAta = await getAssociatedTokenAddress(NATIVE_MINT, v.msPubkey, true);
+      const recipientAta = await getOrCreateAssociatedTokenAccount(
+        conn, feePayer, NATIVE_MINT, session.recipient
+      );
+      
+      const transferIx = createTransferInstruction(
+        wsolAta,
+        recipientAta.address,
+        v.msPubkey,
+        BigInt(Math.floor(amount * 1e9)),
+        [v.kp.publicKey, feePayer.publicKey],
+        TOKEN_PROGRAM_ID
+      );
+      
+      const tx = new Transaction().add(transferIx);
+      tx.feePayer = feePayer.publicKey;
+      tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+      tx.sign(v.kp, feePayer);
+      
+      const sig = await conn.sendRawTransaction(tx.serialize());
+      await conn.confirmTransaction(sig, 'confirmed');
+      sessions.del(ctx.from.id);
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        `✅ *Transaction Successful!*\n\n` +
+        `💎 Amount: ${amount} wSOL\n` +
+        `📤 To: \`${session.recipient.toBase58()}\`\n` +
+        `🔗 [View on Solscan](https://solscan.io/tx/${sig})`,
+        { parse_mode: 'Markdown', ...menu }
+      );
+    } catch(e) {
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        `❌ *Transaction Failed:*\n${e.message}`,
         { parse_mode: 'Markdown' }
       );
-      const w = await convertVault(String(cid), txt);
-      await bot.sendMessage(cid,
-        `✅ *Wallet Locked!*\n\n` +
-        `💰 SOL Deposit Address:\n\`${w.pk}\`\n\n` +
-        `🪙 Token Deposit Address:\n\`${w.ms}\`\n\n` +
-        `🔒 All SOL swept to locked wSOL. All token accounts migrated to multisig.\n` +
-        `The key alone is now useless — on Phantom, on Jupiter, everywhere.`,
-        { parse_mode: 'Markdown', ...backBtn }
+    }
+    return;
+  }
+  
+  if (session.action === 'withdraw_amount') {
+    const amount = parseFloat(text);
+    if (isNaN(amount) || amount <= 0) return ctx.reply('❌ Invalid amount. Enter a positive number.');
+    
+    const vaults = walletCache.get(`v_${ctx.from.id}`) || [];
+    const v = vaults[session.vaultIdx];
+    if (!v) { 
+      sessions.del(ctx.from.id); 
+      return ctx.reply('❌ Vault not found.', menu); 
+    }
+    
+    const wsolBal = await getWsolBalance(v.msPubkey);
+    if (amount * 1e9 > wsolBal) {
+      return ctx.reply(`❌ Insufficient wSOL balance. Available: ${(wsolBal/1e9).toFixed(6)}`);
+    }
+    
+    const statusMsg = await ctx.reply('⏳ Withdrawing to native SOL...');
+    
+    try {
+      const sig = await withdrawWsolToNative(
+        v.kp, 
+        v.msPubkey, 
+        session.recipient, 
+        Math.floor(amount * 1e9)
       );
-      states.delete(cid);
-    }
-
-    else if (s.action === 'bal') {
-      new PublicKey(txt);
-      const b = await getBal(txt);
-      await bot.sendMessage(cid,
-        `📊 \`${txt.slice(0, 16)}...\`\n💰 ${b.sol.toFixed(4)} SOL`,
-        { parse_mode: 'Markdown', ...backBtn }
+      
+      sessions.del(ctx.from.id);
+      
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        `✅ *Withdrawal Successful!*\n\n` +
+        `🏧 Amount: ${amount} SOL (unwrapped)\n` +
+        `📤 To: \`${session.recipient.toBase58()}\`\n` +
+        `🔗 [View on Solscan](https://solscan.io/tx/${sig})\n\n` +
+        `ℹ️ Recipient received native SOL in their wallet.`,
+        { parse_mode: 'Markdown', ...menu }
       );
-      states.delete(cid);
-    }
-
-    else if (s.action === 'to') {
-      new PublicKey(txt);
-      s.to = txt;
-      s.action = 'amt';
-      states.set(cid, s);
-      await bot.sendMessage(cid, '💰 Amount in SOL (recipient gets wSOL):', cancelBtn);
-    }
-
-    else if (s.action === 'amt') {
-      const amt = parseFloat(txt);
-      if (isNaN(amt) || amt <= 0) return bot.sendMessage(cid, '❌ Invalid amount', cancelBtn);
-      s.amt = amt;
-      states.set(cid, s);
-
-      const id = await buildTx(s.from, s.to, amt);
-      s.txId = id;
-      states.set(cid, s);
-
-      await bot.sendMessage(cid,
-        `💸 *Confirm Transaction*\n\n` +
-        `From: \`${s.from.slice(0, 8)}...\`\n` +
-        `To: \`${s.to.slice(0, 8)}...\`\n` +
-        `Amount: ${amt} SOL (as wSOL)\n` +
-        `Gas: sponsored by bot\n\n` +
-        `⚠️ Requires 2 signatures (yours + bot)\n` +
-        `Recipient receives wSOL — unwrappable with any Solana wallet`,
-        {
-          parse_mode: 'Markdown',
-          reply_markup: {
-            inline_keyboard: [[
-              { text: '✅ Confirm & Send', callback_data: `cf_${id}` },
-              { text: '❌ Cancel', callback_data: 'cancel' }
-            ]]
-          }
-        }
+    } catch(e) {
+      await ctx.telegram.editMessageText(
+        statusMsg.chat.id, statusMsg.message_id, null,
+        `❌ *Withdrawal Failed:*\n${e.message}`,
+        { parse_mode: 'Markdown' }
       );
     }
-  } catch (e) {
-    bot.sendMessage(cid, '❌ ' + e.message, cancelBtn).catch(() => {});
+    return;
   }
 });
 
-bot.on('polling_error', err => console.error('POLL ERR:', err.code || err.message));
-process.on('unhandledRejection', err => console.error('UNHANDLED:', err));
+// Error handling
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  ctx?.reply?.('❌ An error occurred. Please try again.')?.catch(() => {});
+});
 
-console.log('✅ BOT READY');
+// Start bot
+(async () => {
+  try {
+    const bal = await conn.getBalance(feePayer.publicKey);
+    console.log(`💰 Fee payer: ${feePayer.publicKey.toBase58()}`);
+    console.log(`💰 Balance: ${bal/LAMPORTS_PER_SOL} SOL`);
+    
+    if (bal < 0.01 * LAMPORTS_PER_SOL) {
+      console.warn('⚠️ Low fee payer balance!');
+    }
+    
+    await bot.launch();
+    console.log('🤖 Bot is running...');
+    
+    process.once('SIGINT', () => bot.stop('SIGINT'));
+    process.once('SIGTERM', () => bot.stop('SIGTERM'));
+  } catch(e) {
+    console.error('Failed to start:', e);
+    process.exit(1);
+  }
+})();
